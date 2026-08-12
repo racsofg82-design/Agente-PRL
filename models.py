@@ -1,4 +1,4 @@
-"""Modelos de datos"""
+"""Modelos de datos - Con referencias normativas"""
 from typing import List, Optional
 from pydantic import BaseModel
 from enum import Enum
@@ -15,6 +15,10 @@ class HazardType(str, Enum):
     QUIMICO = "Químico"
     ALTURA = "Trabajo en altura"
     TRAFICO = "Tráfico"
+    CONFINADO = "Espacio confinado"
+    INCENDIO = "Incendio/Explosión"
+    ERGONOMICO = "Ergonómico"
+    RUIDO = "Ruido"
     OTRO = "Otro"
 
 class IdentifiedHazard(BaseModel):
@@ -26,6 +30,7 @@ class IdentifiedHazard(BaseModel):
     classification: RiskLevel
     justification: str
     control_measures: List[str]
+    normative_references: List[str] = []  # NUEVO: NTPs y RDs aplicables
     residual_risk: Optional[int] = None
 
 class ActivityStep(BaseModel):
@@ -46,12 +51,3 @@ class RiskAssessmentResult(BaseModel):
     overall_risk_level: RiskLevel = RiskLevel.MEDIUM
     critical_hazards_count: int = 0
     recommendations: List[str] = []
-
-class NormativeFinding(BaseModel):
-    severity: str
-    description: str
-    recommendation: str
-
-class PSSReviewResult(BaseModel):
-    overall_compliance: str = "No evaluado"
-    findings: List[NormativeFinding] = []
