@@ -1,11 +1,17 @@
-"""Motor del Agente PRL (Lógica unificada)"""
+"""
+Motor del Agente PRL Senior - Con Biblioteca INSST Integrada
+Analiza procedimientos citando NTPs y normativa específica
+"""
 from typing import List, Dict
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from config import GOODMAN_PMP_RULES, SPANISH_REGULATIONS, NTP_CATALOG, BASE_SYSTEM_PROMPT, PMPRule
+from config import (
+    GOODMAN_PMP_RULES, SPANISH_REGULATIONS, NTP_CATALOG, 
+    BASE_SYSTEM_PROMPT, PMPRule, find_relevant_ntps
+)
 from models import (
     RiskAssessmentResult, ActivityStep, IdentifiedHazard, HazardType, RiskLevel,
-    PMPComplianceCheck, PSSReviewResult, NormativeFinding
+    PMPComplianceCheck
 )
 import json
 import re
@@ -16,68 +22,111 @@ def get_risk_class(level: int) -> RiskLevel:
     if level <= 12: return RiskLevel.HIGH
     return RiskLevel.CRITICAL
 
-def check_pmp_compliance(measures: List[str], pmp_rules: Dict[str, PMPRule]) -> PMPComplianceCheck:
-    text = " ".join(measures).lower()
-    missing = []
-    compliant_count = 0
-    total = len(pmp_rules)
-    
-    for rule in pmp_rules.values():
-        found = any(kw.lower() in text for kw in rule.keywords)
-        if found:
-            compliant_count += 1
-        elif rule.mandatory:
-            missing.append(f"{rule.description} (Ref: {rule.technical_reference})")
-            
-    pct = (compliant_count / total * 100) if total > 0 else 100
-    return PMPComplianceCheck(compliant=len(missing)==0, missing_requirements=missing, compliance_percentage=pct)
+def clean_json_response(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r'^```json\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    return text
 
-def assess_activity(name: str, steps: List[str], location: str, pmp_rules: Dict[str, PMPRule]) -> RiskAssessmentResult:
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2) # Usamos gpt-4o-mini por velocidad y coste
+def analyze_procedure_with_normative(
+    procedure_text: str, 
+    pss_text: str, 
+    pmp_text: str,
+    pmp_rules: Dict[str, PMPRule]
+) -> RiskAssessmentResult:
+    """
+    Analiza el procedimiento integrando NTPs y normativa específica
+    """
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
     
-    ntps_text = ", ".join(NTP_CATALOG.get("trabajos_altura", []))
-    rules_text = "\n".join([f"- {r.description} (Ref: {r.technical_reference})" for r in pmp_rules.values()])
+    # PASO 1: Identificar NTPs y normativa relevante según el contenido
+    relevant_normative = find_relevant_ntps(procedure_text)
     
-    prompt = BASE_SYSTEM_PROMPT.format(
-        regulations="\n".join(SPANISH_REGULATIONS),
-        ntps=ntps_text,
-        pmp_rules=rules_text
+    # Construir contexto normativo enriquecido
+    normative_context = ""
+    if relevant_normative["ntps"]:
+        normative_context += "NTPs APLICABLES A ESTA ACTIVIDAD:\n"
+        for ntp in relevant_normative["ntps"]:
+            normative_context += f"  • {ntp}\n"
+        normative_context += "\n"
+    
+    if relevant_normative["regulations"]:
+        normative_context += "NORMATIVA ESPECÍFICA APLICABLE:\n"
+        for reg in relevant_normative["regulations"]:
+            normative_context += f"  • {reg}\n"
+        normative_context += "\n"
+    
+    # Reglas PMP
+    rules_text = "\n".join([f"- {r.id}: {r.description} (Ref: {r.technical_reference})" for r in pmp_rules.values()])
+    
+    # Contexto de referencia (PSS y PMP)
+    ref_context = ""
+    if pss_text:
+        ref_context += f"--- PSS DEL CLIENTE (Plan de Seguridad y Salud) ---\n{pss_text[:1500]}\n\n"
+    if pmp_text:
+        ref_context += f"--- PMP DEL CLIENTE (Políticas) ---\n{pmp_text[:1500]}\n\n"
+
+    system_prompt = BASE_SYSTEM_PROMPT.format(
+        regulations=", ".join(SPANISH_REGULATIONS)
     )
-    
-    user_msg = f"""
-    Actividad: {name} en {location}.
-    Pasos: {json.dumps(steps, ensure_ascii=False)}
-    
-    Devuelve SOLO un JSON válido con esta estructura exacta, sin markdown:
+
+    user_prompt = f"""
+{normative_context}
+{ref_context}
+
+--- REGLAS PMP OBLIGATORIAS ---
+{rules_text}
+
+--- PROCEDIMIENTO / BORRADOR RAMS A ANALIZAR ---
+{procedure_text}
+
+INSTRUCCIONES CRÍTICAS:
+1. Extrae los pasos del procedimiento.
+2. Para cada paso, identifica TODOS los peligros relevantes.
+3. Para CADA peligro, CITA las NTPs y normativa específica aplicable (usa las del contexto normativo).
+4. Evalúa P y S con rigor técnico.
+5. Propón medidas siguiendo la jerarquía (Eliminación > Sustitución > EPC > Admin > EPI).
+6. Compara contra PSS y PMP. Si hay incumplimiento, márcalo.
+
+Devuelve SOLO un JSON válido con esta estructura exacta:
+{{
+  "activity_name": "Nombre de la actividad",
+  "location": "Ubicación",
+  "steps": [
     {{
-      "steps": [
+      "step_number": 1,
+      "description": "Descripción del paso",
+      "hazards": [
         {{
-          "step_number": 1,
-          "description": "Paso 1",
-          "hazards": [
-            {{
-              "description": "Peligro",
-              "hazard_type": "Mecánico|Eléctrico|Químico|Altura|Tráfico|Otro",
-              "probability": 3,
-              "severity": 4,
-              "justification": "Razón técnica",
-              "control_measures": ["Medida 1", "Medida 2"]
-            }}
-          ]
+          "description": "Peligro específico",
+          "hazard_type": "Mecánico|Eléctrico|Químico|Altura|Tráfico|Confinado|Incendio|Ergonómico|Ruido|Otro",
+          "probability": 3,
+          "severity": 4,
+          "justification": "Justificación técnica de P y S",
+          "control_measures": ["Medida 1 (EPC)", "Medida 2 (Admin)", "Medida 3 (EPI)"],
+          "normative_references": ["NTP 415", "RD 2177/2004"],
+          "pmp_compliance": "Cumple PMP/PSS: SÍ/NO. Motivo."
         }}
       ]
     }}
-    """
-    
+  ],
+  "pmp_missing_requirements": ["Requisito PMP no cumplido 1"],
+  "recommendations": ["Recomendación 1"]
+}}"""
+
     try:
-        response = llm.invoke([SystemMessage(content=prompt), HumanMessage(content=user_msg)])
-        # Limpiar respuesta por si el LLM añade ```json
-        clean_text = re.sub(r'^```json\s*|\s*```$', '', response.content.strip(), flags=re.MULTILINE)
-        data = json.loads(clean_text)
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ])
         
+        data = json.loads(clean_json_response(response.content))
+        
+        # Procesar a modelos Pydantic
         eval_steps = []
         all_measures = []
         critical_count = 0
+        pmp_missing = data.get("pmp_missing_requirements", [])
         
         for s in data.get("steps", []):
             hazards = []
@@ -90,59 +139,79 @@ def assess_activity(name: str, steps: List[str], location: str, pmp_rules: Dict[
                 h_type = h.get("hazard_type", "Otro")
                 if h_type not in HazardType.__members__: h_type = "OTRO"
                 
+                measures = h.get("control_measures", [])
+                all_measures.extend(measures)
+                if cls == RiskLevel.CRITICAL: critical_count += 1
+                
                 hazards.append(IdentifiedHazard(
                     description=h["description"],
                     hazard_type=HazardType(h_type),
                     probability=p, severity=sev, risk_level=level, classification=cls,
                     justification=h.get("justification", ""),
-                    control_measures=h.get("control_measures", [])
+                    control_measures=measures,
+                    normative_references=h.get("normative_references", []),
+                    residual_risk=h.get("residual_risk")
                 ))
-                all_measures.extend(h.get("control_measures", []))
-                if cls == RiskLevel.CRITICAL: critical_count += 1
-                
             eval_steps.append(ActivityStep(step_number=s["step_number"], description=s["description"], hazards=hazards))
-            
-        pmp_check = check_pmp_compliance(all_measures, pmp_rules)
-        recs = []
-        if critical_count > 0: recs.append(f"⚠️ {critical_count} riesgos CRÍTICOS. Revisar método.")
-        if not pmp_check.compliant: recs.append(f"❌ Faltan requisitos PMP: {', '.join(pmp_check.missing_requirements[:2])}")
-        recs.append("📢 Realizar Toolbox Talk antes de iniciar.")
+        
+        # Validación PMP
+        pmp_compliant = len(pmp_missing) == 0
+        pmp_pct = ((len(pmp_rules) - len(pmp_missing)) / len(pmp_rules) * 100) if pmp_rules else 100
+        
+        recs = data.get("recommendations", [])
+        if critical_count > 0:
+            recs.insert(0, f"⚠️ {critical_count} riesgos CRÍTICOS detectados. Revisar método.")
+        if not pmp_compliant:
+            recs.insert(0, f"❌ Incumplimientos PMP/PSS: {', '.join(pmp_missing[:3])}")
+        
+        overall_level = RiskLevel.CRITICAL if critical_count > 0 else RiskLevel.HIGH
         
         return RiskAssessmentResult(
-            activity_name=name, location=location, steps=eval_steps,
-            pmp_compliance=pmp_check,
-            overall_risk_level=RiskLevel.CRITICAL if critical_count > 0 else RiskLevel.HIGH,
-            critical_hazards_count=critical_count, recommendations=recs
+            activity_name=data.get("activity_name", "Actividad no identificada"),
+            location=data.get("location", "No especificada"),
+            steps=eval_steps,
+            pmp_compliance=PMPComplianceCheck(
+                compliant=pmp_compliant, 
+                missing_requirements=pmp_missing, 
+                compliance_percentage=pmp_pct
+            ),
+            overall_risk_level=overall_level,
+            critical_hazards_count=critical_count,
+            recommendations=recs
         )
+        
     except Exception as e:
-        # Fallback si falla el LLM
+        print(f"Error en el motor IA: {e}")
         return RiskAssessmentResult(
-            activity_name=name, location=location,
+            activity_name="Error en el análisis",
+            location="N/A",
             overall_risk_level=RiskLevel.HIGH,
-            recommendations=[f"⚠️ Error en el análisis automático: {str(e)}. Revisar manualmente."]
+            recommendations=[f"Error: {str(e)}. Verifica que el texto sea legible."]
         )
 
-def review_pss(pss_text: str, pmp_rules: Dict[str, PMPRule]) -> PSSReviewResult:
-    findings = []
-    if "evaluación de riesgos" not in pss_text.lower():
-        findings.append(NormativeFinding(severity="Mayor", description="Falta evaluación de riesgos", recommendation="Añadir evaluación detallada"))
-    return PSSReviewResult(
-        overall_compliance="Cumple con observaciones" if len(findings) < 2 else "No cumple",
-        findings=findings
-    )
-
-def execute_prl_workflow(name: str, steps: List[str], location: str, pss_text: str = None, pmp_rules: Dict[str, PMPRule] = None):
-    if pmp_rules is None: pmp_rules = GOODMAN_PMP_RULES
+def execute_prl_workflow(procedure_text: str, pss_text: str = "", pmp_text: str = "") -> Dict:
+    """Orquesta el flujo completo"""
+    print("🚀 Iniciando análisis con integración normativa...")
     
-    risk_res = assess_activity(name, steps, location, pmp_rules)
-    norm_res = review_pss(pss_text, pmp_rules) if pss_text else None
+    risk_res = analyze_procedure_with_normative(procedure_text, pss_text, pmp_text, GOODMAN_PMP_RULES)
+    
+    summary = f"""
+📊 INFORME DE ANÁLISIS PRL CON NORMATIVA INSST
+------------------------------------------------
+Actividad: {risk_res.activity_name}
+Ubicación: {risk_res.location}
+Pasos analizados: {len(risk_res.steps)}
+Riesgos Críticos: {risk_res.critical_hazards_count}
+Cumplimiento PMP/PSS: {risk_res.pmp_compliance.compliance_percentage}%
+
+NORMATIVA APLICADA:
+{chr(10).join(['  • ' + ref for step in risk_res.steps for h in step.hazards for ref in h.normative_references])[:500]}
+"""
     
     return {
         "risk_assessment": risk_res,
-        "normative_review": norm_res,
-        "pmp_validation": risk_res.pmp_compliance,
         "final_report": {
-            "executive_summary": f"✅ Evaluación de '{name}' completada. Riesgos críticos: {risk_res.critical_hazards_count}. PMP: {risk_res.pmp_compliance.compliance_percentage}%",
+            "executive_summary": summary,
             "recommendations": risk_res.recommendations
         }
     }
